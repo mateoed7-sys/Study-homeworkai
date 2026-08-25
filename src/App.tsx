@@ -3,7 +3,7 @@ import AskTab from './components/AskTab';
 import FlashcardsTab from './components/FlashcardsTab';
 import QuizTab from './components/QuizTab';
 import SubjectBar from './components/SubjectBar';
-import { hasApiKey } from './lib/anthropic';
+import { needsLocalKey } from './lib/anthropic';
 import {
   emptyDeck,
   emptyQuiz,
@@ -30,7 +30,7 @@ export default function App() {
   const [quiz, setQuiz] = useState<QuizState>(emptyQuiz);
   const [deck, setDeck] = useState<DeckState>(emptyDeck);
 
-  const keyPresent = hasApiKey();
+  const missingKey = needsLocalKey();
 
   const commit = useCallback(
     (subject: string, notes: string) => {
@@ -60,7 +60,7 @@ export default function App() {
         <p>study &amp; homework companion</p>
       </header>
 
-      {!keyPresent && (
+      {missingKey && (
         <div className="notice notice-error">
           No API key found. Copy <code>.env.example</code> to <code>.env</code>, set{' '}
           <code>VITE_ANTHROPIC_API_KEY</code>, and restart the dev server — Cram cannot reach the

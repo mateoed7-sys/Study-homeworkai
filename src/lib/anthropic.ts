@@ -1,14 +1,20 @@
 /**
- * Thin client for the Anthropic Messages API, called straight from the browser.
+ * Client for the Anthropic Messages API, with two modes.
  *
- * The key lives in .env as VITE_ANTHROPIC_API_KEY. Vite inlines it into the
- * bundle at build time, so anyone with the built JS can read it — fine for a
- * local study tool, not for anything you deploy publicly.
+ * dev  — talks straight to api.anthropic.com using VITE_ANTHROPIC_API_KEY from
+ *        .env. Convenient locally, where you are the only visitor.
+ * prod — POSTs to /api/anthropic, a serverless function that holds the key
+ *        server-side. Production bundles therefore contain no credential at
+ *        all: `import.meta.env.PROD` is resolved at build time, so the direct
+ *        branch (and the key it reads) is dropped by tree-shaking.
+ *
+ * Set VITE_FORCE_PROXY=1 to exercise the proxy path from a dev server.
  */
 
 export const MODEL = 'claude-sonnet-4-6';
 
 const ENDPOINT = 'https://api.anthropic.com/v1/messages';
+const PROXY_PATH = '/api/anthropic';
 const ANTHROPIC_VERSION = '2023-06-01';
 
 export type Role = 'user' | 'assistant';
@@ -25,7 +31,8 @@ export type ApiErrorKind =
   | 'overloaded'
   | 'request'
   | 'network'
-  | 'server';
+  | 'server'
+  | 'no-proxy';
 
 export class ApiError extends Error {
   readonly kind: ApiErrorKind;
@@ -37,15 +44,24 @@ export class ApiError extends Error {
   }
 }
 
+/** 'proxy' in production builds, 'direct' when developing against .env. */
+export function apiMode(): 'direct' | 'proxy' {
+  return import.meta.env.PROD || import.meta.env.VITE_FORCE_PROXY === '1' ? 'proxy' : 'direct';
+}
+
 export function readApiKey(): string {
   const raw = import.meta.env.VITE_ANTHROPIC_API_KEY;
   return typeof raw === 'string' ? raw.trim() : '';
 }
 
-/** True when a plausible key is present — not a guarantee that it is valid. */
-export function hasApiKey(): boolean {
+function hasLocalKey(): boolean {
   const key = readApiKey();
   return key.length > 0 && key !== 'sk-ant-...';
+}
+
+/** True only when running locally with no usable key — the case worth a banner. */
+export function needsLocalKey(): boolean {
+  return apiMode() === 'direct' && !hasLocalKey();
 }
 
 interface AskOptions {
@@ -69,55 +85,72 @@ export async function askClaude({
   temperature = 1,
   signal,
 }: AskOptions): Promise<string> {
-  const apiKey = readApiKey();
-  if (!hasApiKey()) {
-    throw new ApiError(
-      'missing-key',
-      'No API key found. Add VITE_ANTHROPIC_API_KEY to a .env file in the project root, then restart the dev server.',
-    );
+  const mode = apiMode();
+  const payload = {
+    max_tokens: maxTokens,
+    temperature,
+    system,
+    messages: messages.map((m) => ({ role: m.role, content: m.content })),
+  };
+
+  let request: { url: string; headers: Record<string, string>; body: string };
+
+  if (mode === 'proxy') {
+    request = {
+      url: PROXY_PATH,
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    };
+  } else {
+    if (!hasLocalKey()) {
+      throw new ApiError(
+        'missing-key',
+        'No API key found. Add VITE_ANTHROPIC_API_KEY to a .env file in the project root, then restart the dev server.',
+      );
+    }
+    request = {
+      url: ENDPOINT,
+      headers: {
+        'content-type': 'application/json',
+        'x-api-key': readApiKey(),
+        'anthropic-version': ANTHROPIC_VERSION,
+        // Required for browser-originated calls to the API.
+        'anthropic-dangerous-direct-browser-access': 'true',
+      },
+      body: JSON.stringify({ model: MODEL, ...payload }),
+    };
   }
 
   let response: Response;
   try {
-    response = await fetch(ENDPOINT, {
+    response = await fetch(request.url, {
       method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        'x-api-key': apiKey,
-        'anthropic-version': ANTHROPIC_VERSION,
-        // Required for browser-originated calls; opts this request out of the
-        // SDK's usual "keys don't belong in a client" guard.
-        'anthropic-dangerous-direct-browser-access': 'true',
-      },
-      body: JSON.stringify({
-        model: MODEL,
-        max_tokens: maxTokens,
-        temperature,
-        system,
-        messages: messages.map((m) => ({ role: m.role, content: m.content })),
-      }),
+      headers: request.headers,
+      body: request.body,
       signal,
     });
   } catch (error) {
     if (error instanceof DOMException && error.name === 'AbortError') throw error;
     throw new ApiError(
       'network',
-      'Could not reach the Anthropic API. Check your connection and try again.',
+      mode === 'proxy'
+        ? 'Could not reach the server. Check your connection and try again.'
+        : 'Could not reach the Anthropic API. Check your connection and try again.',
     );
   }
 
   if (!response.ok) {
-    throw new ApiError(kindForStatus(response.status), await messageForError(response));
+    throw new ApiError(kindForStatus(response.status, mode), await messageForError(response, mode));
   }
 
-  let payload: { content?: ContentBlock[] };
+  let payloadOut: { content?: ContentBlock[] };
   try {
-    payload = await response.json();
+    payloadOut = await response.json();
   } catch {
     throw new ApiError('server', 'The API returned a response that could not be read.');
   }
 
-  const text = (payload.content ?? [])
+  const text = (payloadOut.content ?? [])
     .filter((block) => block.type === 'text' && typeof block.text === 'string')
     .map((block) => block.text as string)
     .join('')
@@ -130,15 +163,18 @@ export async function askClaude({
   return text;
 }
 
-function kindForStatus(status: number): ApiErrorKind {
+function kindForStatus(status: number, mode: 'direct' | 'proxy'): ApiErrorKind {
   if (status === 401 || status === 403) return 'auth';
+  if (status === 404 && mode === 'proxy') return 'no-proxy';
   if (status === 429) return 'rate-limit';
+  // The proxy answers 503 when the server has no key configured.
+  if (status === 503 && mode === 'proxy') return 'missing-key';
   if (status === 529) return 'overloaded';
   if (status >= 500) return 'server';
   return 'request';
 }
 
-async function messageForError(response: Response): Promise<string> {
+async function messageForError(response: Response, mode: 'direct' | 'proxy'): Promise<string> {
   let detail = '';
   try {
     const body = (await response.json()) as { error?: { message?: string } };
@@ -147,11 +183,18 @@ async function messageForError(response: Response): Promise<string> {
     detail = '';
   }
 
-  switch (kindForStatus(response.status)) {
+  switch (kindForStatus(response.status, mode)) {
+    case 'missing-key':
+      // The function's own message names the exact setting to change.
+      return detail || 'This deployment has no API key configured yet.';
+    case 'no-proxy':
+      return 'The /api/anthropic endpoint is not running. A production build expects to be served by Vercel — use `npm run dev` locally instead.';
     case 'auth':
-      return 'That API key was rejected. Check VITE_ANTHROPIC_API_KEY in your .env file, then restart the dev server.';
+      return mode === 'proxy'
+        ? "The server's API key was rejected. Update ANTHROPIC_API_KEY in the Vercel project settings and redeploy."
+        : 'That API key was rejected. Check VITE_ANTHROPIC_API_KEY in your .env file, then restart the dev server.';
     case 'rate-limit':
-      return 'Rate limited by the API. Wait a moment and try again.';
+      return detail || 'Rate limited. Wait a moment and try again.';
     case 'overloaded':
       return 'The model is overloaded right now. Give it a few seconds and try again.';
     case 'server':

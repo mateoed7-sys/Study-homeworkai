@@ -23,9 +23,42 @@ VITE_ANTHROPIC_API_KEY=sk-ant-...
 Get one at [console.anthropic.com](https://console.anthropic.com/settings/keys). `.env` is
 gitignored. Vite only reads `.env` at startup, so restart the dev server after editing it.
 
-> **Heads up:** Vite inlines `VITE_`-prefixed variables into the bundle, so the key is readable by
-> anyone who can load the page. That is fine for a tool you run locally; if you ever deploy Cram,
-> put a small proxy in front of the API and keep the key server-side.
+The dev server also prints a `Network:` URL. Open that on a phone on the same wi-fi to use the
+real mobile layout.
+
+## Two ways it reaches the API
+
+| | `npm run dev` | deployed build |
+| --- | --- | --- |
+| Calls | `api.anthropic.com` directly from the browser | `/api/anthropic` on your host |
+| Key comes from | `VITE_ANTHROPIC_API_KEY` in `.env` | `ANTHROPIC_API_KEY` in the host's env |
+| Key in the JS bundle | yes | **no** |
+
+`import.meta.env.PROD` picks the branch at build time, so the direct-call code and the key it
+reads are dropped from production bundles entirely — a build made with a populated `.env`
+contains neither the key nor `api.anthropic.com`. Set `VITE_FORCE_PROXY=1` to exercise the proxy
+path from a dev server.
+
+## Deploying
+
+The repo is Vercel-shaped: `api/anthropic.js` becomes a serverless function, the Vite build is
+served as static files, and `vercel.json` raises the function timeout to 60s so a ten-card draw
+does not get cut off.
+
+After deploying, set `ANTHROPIC_API_KEY` in the project's **Settings → Environment Variables**
+and redeploy. Until then the app loads but every action reports that the deployment has no key,
+naming that exact setting.
+
+### The proxy is public
+
+Anyone who finds the URL can spend your API credits through it. `api/anthropic.js` mitigates the
+obvious abuse — the model is pinned server-side so a caller cannot swap in a pricier one,
+`max_tokens` is capped at 4096, request size and message count are bounded, and there is a coarse
+20-requests-per-minute per-IP throttle (per instance, so a cold start forgets it).
+
+That is enough to make casual abuse unrewarding, not enough to stop someone determined. If the
+URL will be shared or indexed, put Vercel's Deployment Protection in front of the project, which
+requires a login before any request reaches the function.
 
 ## How it works
 
@@ -54,11 +87,13 @@ failures each get their own inline message.
 ## Layout
 
 ```
+api/
+  anthropic.js           serverless proxy: holds the key, pins the model, caps abuse
 src/
   App.tsx                  top-level state: subject, notes, tab, chat, quiz, deck
   types.ts                 shared types and empty states
   lib/
-    anthropic.ts           the Messages API client and error mapping
+    anthropic.ts           API client: direct in dev, proxied in prod
     json.ts                fence stripping and validated array parsing
     prompts.ts             system/user prompts for all three tabs
   components/
